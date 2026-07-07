@@ -1,0 +1,13 @@
+
+__pycache__/
+
+deployment files/*.pem
+deployment files/*.key
+
+
+received_files/
+*.enc
+*.sig
+
+
+*.log
