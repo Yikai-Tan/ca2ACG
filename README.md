@@ -61,5 +61,5 @@ in ./recieved_files
 | **Handshake / Non-Repudiation** | RSA-2048 / PSS | NIST-compliant key size; PSS padding offers randomized encoding and formal security proofs. |
 | **Key Derivation (KDF)** | HKDF-SHA256 | Derives distinct session keys from a single master secret using domain separations. |
 | **Symmetric Encryption** | AES-256-CBC | Confirms confidentiality with random, unique IVs generated per encryption. |
-| **Authentication / Integrity** | HMAC-SHA256 | Authenticates the ciphertext (`IV || Ciphertext`) to prevent tampering and oracle attacks. |
+| **Authentication / Integrity** | HMAC-SHA256 | Authenticates the ciphertext (IV \|\| Ciphertext) to prevent tampering and oracle attacks. |
 | **Constant-Time Verification** | `compare_digest` | Mitigates timing side-channel attacks during HMAC validation. |
