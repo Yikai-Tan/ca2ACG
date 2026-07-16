@@ -1,8 +1,10 @@
+# >>>>> GCM SWAP: START >>>>>
 """
-RSA challenge-response auth, AES-256-CBC
-encryption with HMAC-SHA256 (Encrypt-then-MAC), and RSA-PSS signatures.
+RSA challenge-response auth, AES-256-GCM
+encryption (built-in authentication, no separate HMAC), and RSA-PSS signatures.
 
 """
+# <<<<< GCM SWAP: END <<<<<
 
 import os
 import sys
@@ -118,37 +120,33 @@ def transfer_file(sock, filepath: str, client_private_key, shared_secret: bytes)
     file_signature = sign_file(client_private_key, file_data)
     print(f"[TRANSFER] [OK] RSA signature generated ({len(file_signature)} bytes)")
 
-    # Derive AES + HMAC keys via HKDF (fresh salt per transfer)
-    print("[TRANSFER] Deriving session keys via HKDF-SHA256...")
+    # >>>>> GCM SWAP: START >>>>>
+    # Derive AES key via HKDF (fresh salt per transfer).
+    # Only one key now -- no separate HMAC key needed.
+    print("[TRANSFER] Deriving session key via HKDF-SHA256...")
     salt = os.urandom(crypto_utils.HKDF_SALT_SIZE)
-    aes_key, hmac_key = crypto_utils.derive_keys(shared_secret, salt)
+    aes_key = crypto_utils.derive_keys(shared_secret, salt)
     print(f"[TRANSFER]   Session salt: {salt.hex()}")
     print(f"[TRANSFER]   [OK] AES-256 key derived (info='aes-encryption-key')")
-    print(f"[TRANSFER]   [OK] HMAC key derived   (info='hmac-authentication-key')")
 
-    # AES-256-CBC encryption
-    print("[TRANSFER] Encrypting file with AES-256-CBC...")
-    iv, ciphertext = crypto_utils.aes_cbc_encrypt(aes_key, file_data)
-    print(f"[TRANSFER]   IV:         {iv.hex()}")
-    print(f"[TRANSFER]   Ciphertext: {len(ciphertext):,} bytes "
-          f"(+{len(ciphertext) - len(file_data)} bytes padding overhead)")
+    # AES-256-GCM encryption -- produces ciphertext AND an authentication
+    # tag in one call. No padding, no separate MAC step.
+    print("[TRANSFER] Encrypting file with AES-256-GCM...")
+    iv, ciphertext, tag = crypto_utils.aes_gcm_encrypt(aes_key, file_data)
+    print(f"[TRANSFER]   Nonce:      {iv.hex()}")
+    print(f"[TRANSFER]   Tag:        {tag.hex()}")
+    print(f"[TRANSFER]   Ciphertext: {len(ciphertext):,} bytes")
 
-    # HMAC-SHA256 over (IV || ciphertext) -- Encrypt-then-MAC
-    print("[TRANSFER] Computing HMAC-SHA256 over (IV || ciphertext)...")
-    hmac_data = iv + ciphertext
-    mac = crypto_utils.compute_hmac(hmac_key, hmac_data)
-    print(f"[TRANSFER]   HMAC:       {mac.hex()[:40]}...")
-    print(f"[TRANSFER]   HMAC input: {len(hmac_data):,} bytes (16-byte IV + ciphertext)")
-
-    # Build and send JSON payload
+    # Build and send JSON payload -- "hmac" field replaced by "tag"
     payload = {
         "salt":       salt.hex(),
         "iv":         iv.hex(),
-        "hmac":       mac.hex(),
+        "tag":        tag.hex(),
         "ciphertext": base64.b64encode(ciphertext).decode("utf-8"),
         "filename":   filename,
         "signature":  base64.b64encode(file_signature).decode("utf-8"),
     }
+    # <<<<< GCM SWAP: END <<<<<
 
     payload_json = json.dumps(payload, indent=None)
     payload_bytes = payload_json.encode("utf-8")
@@ -164,11 +162,13 @@ def transfer_file(sock, filepath: str, client_private_key, shared_secret: bytes)
         if result == b"TRANSFER_OK":
             print("[TRANSFER] [OK] Server confirmed successful receipt and storage!")
             return True
-        elif result == b"HMAC_FAIL":
-            print("[TRANSFER] [FAIL] Server reported HMAC verification failure!")
+        # >>>>> GCM SWAP: START >>>>>
+        elif result == b"TAG_FAIL":
+            print("[TRANSFER] [FAIL] Server reported GCM tag verification failure!")
             print("[TRANSFER]   The data may have been tampered with in transit,")
             print("[TRANSFER]   or the shared secrets don't match.")
             return False
+        # <<<<< GCM SWAP: END <<<<<
         else:
             decoded = result.decode("utf-8", errors="replace")
             print(f"[TRANSFER] [FAIL] Unexpected server response: {decoded}")
@@ -185,8 +185,10 @@ def main():
     """Parse arguments, load keys, connect, authenticate, and transfer the file."""
     print("=" * 64)
     print("  +======================================================+")
+    # >>>>> GCM SWAP: START >>>>>
     print("  |         SECURE FILE TRANSFER CLIENT v1.0            |")
-    print("  |   AES-256-CBC + HMAC-SHA256 + RSA-PSS Signatures   |")
+    print("  |   AES-256-GCM + RSA-PSS Signatures                 |")
+    # <<<<< GCM SWAP: END <<<<<
     print("  +======================================================+")
     print("=" * 64)
 

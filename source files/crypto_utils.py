@@ -1,11 +1,9 @@
+# >>>>> GCM SWAP: START >>>>>
 import os
 import struct
-import hmac as hmac_stdlib
 
 # Cryptography library imports (hazmat primitives)
 from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives import hmac
-from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.ciphers import (
@@ -13,42 +11,41 @@ from cryptography.hazmat.primitives.ciphers import (
     algorithms,
     modes,
 )
+# InvalidTag is raised by GCM decryption when the tag doesn't match —
+# this IS the integrity check now, built into the cipher itself.
+from cryptography.exceptions import InvalidTag
 
 
 # Constants
 AES_KEY_SIZE = 32
-HMAC_KEY_SIZE = 32
 HKDF_SALT_SIZE = 16
-AES_IV_SIZE = 16
-AES_BLOCK_SIZE_BITS = 128
+# GCM nonces are 12 bytes (96 bits) by convention — this is the size GCM is
+# designed and optimized for, unlike CBC's 16-byte IV.
+AES_GCM_NONCE_SIZE = 12
 NONCE_SIZE = 32
-HMAC_DIGEST_SIZE = 32
 MSG_LENGTH_PREFIX_SIZE = 4
+# HMAC_KEY_SIZE, AES_BLOCK_SIZE_BITS, HMAC_DIGEST_SIZE removed — they were
+# only needed for the old separate-HMAC and PKCS7-padding machinery, which
+# GCM replaces entirely.
 
 
 # Key Derivation
-# Uses HKDF-SHA256 to derive independent AES and HMAC keys from a master secret.
-# Different `info` domain separators ensure cryptographic key independence.
+# Uses HKDF-SHA256 to derive the AES key from a master secret.
+# NOTE: previously this also derived a separate HMAC key. GCM produces its
+# own authentication tag as part of encryption, so a second, separately
+# managed HMAC key is no longer needed — one less key to derive, store,
+# and keep straight.
 
-def derive_keys(shared_secret: bytes, salt: bytes) -> tuple:
-    """Derive AES-256 and HMAC-SHA256 keys from shared secret using HKDF."""
+def derive_keys(shared_secret: bytes, salt: bytes) -> bytes:
+    """Derive an AES-256 key from the shared secret using HKDF."""
     hkdf_aes = HKDF(
         algorithm=hashes.SHA256(),
         length=AES_KEY_SIZE,
         salt=salt,
         info=b"aes-encryption-key",
     )
-    aes_key = hkdf_aes.derive(shared_secret)
-
-    hkdf_hmac = HKDF(
-        algorithm=hashes.SHA256(),
-        length=HMAC_KEY_SIZE,
-        salt=salt,
-        info=b"hmac-authentication-key",
-    )
-    hmac_key = hkdf_hmac.derive(shared_secret)
-
-    return aes_key, hmac_key
+    return hkdf_aes.derive(shared_secret)
+# <<<<< GCM SWAP: END <<<<<
 
 
 def derive_at_rest_key(shared_secret: bytes, salt: bytes) -> bytes:
@@ -62,50 +59,32 @@ def derive_at_rest_key(shared_secret: bytes, salt: bytes) -> bytes:
     return hkdf.derive(shared_secret)
 
 
-# AES-256-CBC Encryption & Decryption
-# Uses PKCS7 padding and a fresh random IV per encryption call.
-# Must be paired with HMAC (Encrypt-then-MAC) for integrity.
+# >>>>> GCM SWAP: START >>>>>
+# AES-256-GCM Encryption & Decryption
+# GCM is an AEAD (Authenticated Encryption with Associated Data) mode:
+# encryption and integrity-checking happen together, in one primitive.
+# No padding needed (unlike CBC), and no separate HMAC needed either —
+# the "tag" IS the integrity proof.
 
-def aes_cbc_encrypt(key: bytes, plaintext: bytes) -> tuple:
-    """Encrypt plaintext using AES-256-CBC with PKCS7 padding. Returns (iv, ciphertext)."""
-    iv = os.urandom(AES_IV_SIZE)
+def aes_gcm_encrypt(key: bytes, plaintext: bytes) -> tuple:
+    """Encrypt plaintext using AES-256-GCM. Returns (nonce, ciphertext, tag)."""
+    nonce = os.urandom(AES_GCM_NONCE_SIZE)
 
-    padder = padding.PKCS7(AES_BLOCK_SIZE_BITS).padder()
-    padded_plaintext = padder.update(plaintext) + padder.finalize()
+    encryptor = Cipher(algorithms.AES(key), modes.GCM(nonce)).encryptor()
+    ciphertext = encryptor.update(plaintext) + encryptor.finalize()
 
-    cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
-    encryptor = cipher.encryptor()
-    ciphertext = encryptor.update(padded_plaintext) + encryptor.finalize()
-
-    return iv, ciphertext
-
-
-def aes_cbc_decrypt(key: bytes, iv: bytes, ciphertext: bytes) -> bytes:
-    """Decrypt AES-256-CBC ciphertext and remove PKCS7 padding."""
-    cipher = Cipher(algorithms.AES(key), modes.CBC(iv))
-    decryptor = cipher.decryptor()
-    padded_plaintext = decryptor.update(ciphertext) + decryptor.finalize()
-
-    unpadder = padding.PKCS7(AES_BLOCK_SIZE_BITS).unpadder()
-    plaintext = unpadder.update(padded_plaintext) + unpadder.finalize()
-
-    return plaintext
+    # encryptor.tag is only available AFTER finalize() — it's computed from
+    # everything that was encrypted, and is what the receiver checks against.
+    return nonce, ciphertext, encryptor.tag
 
 
-# HMAC-SHA256 Message Authentication
-# Implements the MAC step of Encrypt-then-MAC over (IV || ciphertext).
-
-def compute_hmac(key: bytes, data: bytes) -> bytes:
-    """Compute an HMAC-SHA256 tag over the given data."""
-    h = hmac.HMAC(key, hashes.SHA256())
-    h.update(data)
-    return h.finalize()
-
-
-def verify_hmac(key: bytes, data: bytes, expected_mac: bytes) -> bool:
-    """Verify an HMAC-SHA256 tag using constant-time comparison."""
-    computed_mac = compute_hmac(key, data)
-    return hmac_stdlib.compare_digest(computed_mac, expected_mac)
+def aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes) -> bytes:
+    """Decrypt AES-256-GCM ciphertext. Raises InvalidTag if the data was
+    tampered with or corrupted — this call IS the integrity check, there's
+    no separate verify step to remember."""
+    decryptor = Cipher(algorithms.AES(key), modes.GCM(nonce, tag)).decryptor()
+    return decryptor.update(ciphertext) + decryptor.finalize()
+# <<<<< GCM SWAP: END <<<<<
 
 
 # Length-Prefixed TCP Message Framing

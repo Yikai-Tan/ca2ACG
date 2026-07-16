@@ -1,9 +1,11 @@
+# >>>>> GCM SWAP: START >>>>>
 """
 Secure File Transfer Server -- receives encrypted files over TCP,
-verifies HMAC integrity, and stores them encrypted at rest with RSA signatures.
+verifies integrity via AES-GCM, and stores them encrypted at rest with RSA signatures.
 
 Contributed by: [Member Name]
 """
+# <<<<< GCM SWAP: END <<<<<
 
 import os
 import sys
@@ -15,7 +17,7 @@ import datetime
 # Cryptographic primitives
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
-from cryptography.exceptions import InvalidSignature
+from cryptography.exceptions import InvalidSignature, InvalidTag
 
 # Shared crypto utilities
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -87,10 +89,10 @@ def perform_handshake(conn, client_public_key) -> bool:
         return False
 
 
-# Receive File + Encrypt-then-MAC Verification
+# Receive File + AES-GCM Verification
 
 def receive_and_store_file(conn, shared_secret: bytes) -> bool:
-    """Receive an encrypted file, verify HMAC, decrypt, and store encrypted at rest."""
+    """Receive an encrypted file, decrypt+verify with AES-GCM, and store encrypted at rest."""
     print("\n[TRANSFER] Waiting for file transfer payload...")
 
     # Receive and parse JSON payload
@@ -104,11 +106,13 @@ def receive_and_store_file(conn, shared_secret: bytes) -> bool:
         print(f"[TRANSFER] [FAIL] Malformed JSON payload: {e}")
         return False
 
-    # Decode binary fields from transport encoding
+    # >>>>> GCM SWAP: START >>>>>
+    # Decode binary fields from transport encoding.
+    # "hmac" is gone -- replaced by "tag", the GCM authentication tag.
     try:
         salt           = bytes.fromhex(payload["salt"])
-        iv             = bytes.fromhex(payload["iv"])
-        received_hmac  = bytes.fromhex(payload["hmac"])
+        iv             = bytes.fromhex(payload["iv"])  # this is the GCM nonce
+        tag            = bytes.fromhex(payload["tag"])
         ciphertext     = base64.b64decode(payload["ciphertext"])
         filename       = payload["filename"]
         file_signature = base64.b64decode(payload["signature"])
@@ -118,53 +122,42 @@ def receive_and_store_file(conn, shared_secret: bytes) -> bool:
 
     print(f"[TRANSFER] Received payload for file: '{filename}'")
     print(f"[TRANSFER]   Salt:       {salt.hex()}")
-    print(f"[TRANSFER]   IV:         {iv.hex()}")
-    print(f"[TRANSFER]   HMAC:       {received_hmac.hex()[:40]}...")
+    print(f"[TRANSFER]   Nonce:      {iv.hex()}")
+    print(f"[TRANSFER]   Tag:        {tag.hex()}")
     print(f"[TRANSFER]   Ciphertext: {len(ciphertext):,} bytes")
     print(f"[TRANSFER]   Signature:  {len(file_signature)} bytes")
 
-    # Re-derive AES + HMAC keys using HKDF
-    print("[TRANSFER] Re-deriving AES + HMAC keys via HKDF-SHA256...")
-    aes_key, hmac_key = crypto_utils.derive_keys(shared_secret, salt)
-    print("[TRANSFER] [OK] Keys derived successfully.")
+    # Re-derive the AES key using HKDF (only one key now -- no HMAC key).
+    print("[TRANSFER] Re-deriving AES key via HKDF-SHA256...")
+    aes_key = crypto_utils.derive_keys(shared_secret, salt)
+    print("[TRANSFER] [OK] Key derived successfully.")
 
-    # Verify HMAC before decryption (Encrypt-then-MAC)
-    print("[TRANSFER] +===============================================+")
-    print("[TRANSFER] |  VERIFYING HMAC (Encrypt-then-MAC)          |")
-    print("[TRANSFER] +===============================================+")
-
-    hmac_data = iv + ciphertext
-
-    if not crypto_utils.verify_hmac(hmac_key, hmac_data, received_hmac):
+    # Decrypt + verify in one step (AES-GCM).
+    # There is no separate "check first, then decrypt" phase anymore --
+    # aes_gcm_decrypt() IS the integrity check. If the tag doesn't match,
+    # it raises InvalidTag instead of returning anything, so there's no
+    # way to accidentally skip the check.
+    print("[TRANSFER] Decrypting + verifying with AES-256-GCM...")
+    try:
+        plaintext = crypto_utils.aes_gcm_decrypt(aes_key, iv, ciphertext, tag)
+    except InvalidTag:
         print("[TRANSFER] +===============================================+")
-        print("[TRANSFER] |  [FAIL] HMAC VERIFICATION FAILED!                |")
+        print("[TRANSFER] |  [FAIL] GCM TAG VERIFICATION FAILED!             |")
         print("[TRANSFER] |  Data integrity compromised -- aborting.     |")
         print("[TRANSFER] +===============================================+")
         print("[TRANSFER] Possible causes:")
         print("[TRANSFER]   - Ciphertext tampered with in transit")
-        print("[TRANSFER]   - IV modified by an attacker")
+        print("[TRANSFER]   - Nonce or tag modified by an attacker")
         print("[TRANSFER]   - Client and server have different shared secrets")
 
         try:
-            crypto_utils.send_msg(conn, b"HMAC_FAIL")
+            crypto_utils.send_msg(conn, b"TAG_FAIL")
         except Exception:
             pass
         return False
 
-    print("[TRANSFER] [OK] HMAC verified -- ciphertext integrity and authenticity confirmed!")
-    print("[TRANSFER]   (No tampering detected; safe to proceed with decryption)")
-
-    # Decrypt ciphertext (AES-256-CBC)
-    print("[TRANSFER] Decrypting file data with AES-256-CBC...")
-    try:
-        plaintext = crypto_utils.aes_cbc_decrypt(aes_key, iv, ciphertext)
-    except ValueError as e:
-        print(f"[TRANSFER] [FAIL] Decryption failed (padding error): {e}")
-        print("[TRANSFER]   This should not happen after HMAC verification.")
-        print("[TRANSFER]   Possible implementation bug or key mismatch.")
-        return False
-
-    print(f"[TRANSFER] [OK] Decrypted {len(plaintext):,} bytes of original file data.")
+    print(f"[TRANSFER] [OK] Decrypted + verified {len(plaintext):,} bytes of original file data.")
+    # <<<<< GCM SWAP: END <<<<<
 
     # Store file encrypted at rest
     print("[TRANSFER] Re-encrypting file for at-rest storage...")
@@ -174,17 +167,23 @@ def receive_and_store_file(conn, shared_secret: bytes) -> bool:
     at_rest_salt = os.urandom(crypto_utils.HKDF_SALT_SIZE)
     at_rest_key = crypto_utils.derive_at_rest_key(shared_secret, at_rest_salt)
 
-    at_rest_iv, at_rest_ciphertext = crypto_utils.aes_cbc_encrypt(
+    # >>>>> GCM SWAP: START >>>>>
+    # Same GCM swap applies here -- the stored file now gets its own
+    # authentication tag too, so tampering with the .enc file on disk
+    # (not just in transit) becomes detectable.
+    at_rest_iv, at_rest_ciphertext, at_rest_tag = crypto_utils.aes_gcm_encrypt(
         at_rest_key, plaintext
     )
 
-    # Save format: [salt][IV][ciphertext]
+    # Save format: [salt][nonce][tag][ciphertext] -- tag is always 16 bytes
     enc_filepath = os.path.join(RECEIVED_DIR, filename + ".enc")
     with open(enc_filepath, "wb") as f:
         f.write(at_rest_salt)
         f.write(at_rest_iv)
+        f.write(at_rest_tag)
         f.write(at_rest_ciphertext)
     print(f"[TRANSFER] [OK] Encrypted file saved: {enc_filepath}")
+    # <<<<< GCM SWAP: END <<<<<
 
     # Store RSA signature for non-repudiation
     sig_filepath = os.path.join(RECEIVED_DIR, filename + ".sig")
@@ -213,8 +212,10 @@ def main():
     """Initialize the server, load keys, and listen for incoming connections."""
     print("=" * 64)
     print("  +======================================================+")
+    # >>>>> GCM SWAP: START >>>>>
     print("  |         SECURE FILE TRANSFER SERVER v1.0            |")
-    print("  |   AES-256-CBC + HMAC-SHA256 + RSA-PSS Signatures   |")
+    print("  |   AES-256-GCM + RSA-PSS Signatures                 |")
+    # <<<<< GCM SWAP: END <<<<<
     print("  +======================================================+")
     print("=" * 64)
 
