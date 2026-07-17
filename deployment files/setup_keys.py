@@ -16,6 +16,24 @@ RSA_PUBLIC_EXPONENT = 65537  # Standard public exponent (Fermat prime F4)
 SHARED_SECRET_LENGTH = 32    # 256 bits of entropy for the master secret
 
 
+def _get_passphrase() -> bytes:
+    """Read the private-key passphrase from the KEY_PASSPHRASE env var.
+
+    Storing the passphrase outside the source tree keeps it out of version
+    control. NOTE: this protects keys against OFFLINE theft (stolen disk,
+    leaked backup) -- it does NOT protect against a fully compromised running
+    host, where the passphrase and the decrypted key exist in memory anyway.
+    Hardware isolation (HSM/TPM) would be required for that.
+    """
+    pw = os.environ.get("KEY_PASSPHRASE")
+    if not pw:
+        raise RuntimeError(
+            "KEY_PASSPHRASE environment variable is not set.\n"
+            "  Set it before running, e.g.:  export KEY_PASSPHRASE='your-passphrase'"
+        )
+    return pw.encode("utf-8")
+
+
 def generate_rsa_keypair(private_path: str, public_path: str, label: str) -> None:
     """Generate an RSA-2048 key pair and save both keys as PEM files."""
     print(f"\n  Generating {RSA_KEY_SIZE}-bit RSA key pair for {label}...")
@@ -29,7 +47,7 @@ def generate_rsa_keypair(private_path: str, public_path: str, label: str) -> Non
     private_pem = private_key.private_bytes(
         encoding=serialization.Encoding.PEM,
         format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
+        encryption_algorithm=serialization.BestAvailableEncryption(_get_passphrase()),
     )
 
     with open(private_path, "wb") as f:
@@ -48,16 +66,16 @@ def generate_rsa_keypair(private_path: str, public_path: str, label: str) -> Non
     print(f"    [+] Public key saved:  {os.path.basename(public_path)}")
 
 
-def generate_shared_secret(secret_path: str) -> None:
-    """Generate a cryptographically secure random shared secret and save it."""
+def generate_store_key(secret_path: str) -> None:
+    """Generate a server-only AES-256 key for encrypting files AT REST."""
     print(f"\n  Generating {SHARED_SECRET_LENGTH}-byte ({SHARED_SECRET_LENGTH * 8}-bit) "
-          f"master shared secret...")
+          f"server-only at-rest store key...")
 
     secret = os.urandom(SHARED_SECRET_LENGTH)
 
     with open(secret_path, "wb") as f:
         f.write(secret)
-    print(f"    [+] Shared secret saved: {os.path.basename(secret_path)}")
+    print(f"    [+] Store key saved: {os.path.basename(secret_path)}")
     print(f"    [i] Secret entropy: {SHARED_SECRET_LENGTH * 8} bits")
 
 
@@ -86,10 +104,13 @@ def main():
         label="SERVER",
     )
 
-    # Step 3: Generate the master shared secret
+    # Step 3: Generate the SERVER-ONLY at-rest store key
+    #         (Transit keys are NO LONGER pre-shared; the client generates a
+    #          fresh random session key each transfer and RSA-wraps it to the
+    #          server's public key -- see client.py / server.py.)
     print("-" * 40)
-    generate_shared_secret(
-        secret_path=os.path.join(script_dir, "shared_secret.key"),
+    generate_store_key(
+        secret_path=os.path.join(script_dir, "server_store.key"),
     )
 
     # Output
@@ -101,8 +122,8 @@ def main():
     print("    - client_public.pem    (CLIENT RSA public key)")
     print("    - server_private.pem   (SERVER RSA private key)")
     print("    - server_public.pem    (SERVER RSA public key)")
-    print("    - shared_secret.key    (Master shared secret for HKDF)")
-    print("\n  IMPORTANT: Keep private keys and shared_secret.key confidential!")
+    print("    - server_store.key     (SERVER-ONLY key for at-rest encryption)")
+    print("\n  IMPORTANT: Keep private keys and server_store.key confidential!")
     print("  Next step: Start server.py, then run client.py.\n")
 
 

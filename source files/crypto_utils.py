@@ -151,11 +151,21 @@ def _recv_exact(sock, num_bytes: int) -> bytes:
 # RSA Key & Shared Secret Loading
 
 def load_private_key(path: str):
-    """Load an RSA private key from a PEM file."""
+    """Load a passphrase-encrypted RSA private key from a PEM file.
+
+    The passphrase is read from the KEY_PASSPHRASE environment variable so it
+    is never hardcoded in the source tree.
+    """
+    pw = os.environ.get("KEY_PASSPHRASE")
+    if not pw:
+        raise RuntimeError(
+            "KEY_PASSPHRASE environment variable is not set.\n"
+            "  Set it before running, e.g.:  export KEY_PASSPHRASE='your-passphrase'"
+        )
     with open(path, "rb") as f:
         return serialization.load_pem_private_key(
             f.read(),
-            password=None,
+            password=pw.encode("utf-8"),
         )
 
 
@@ -169,3 +179,32 @@ def load_shared_secret(path: str) -> bytes:
     """Load the master shared secret from a binary file."""
     with open(path, "rb") as f:
         return f.read()
+
+
+# RSA-OAEP Key Wrapping (Key Transport)
+# Client wraps a fresh random session key with the server's PUBLIC key.
+# Only the server, holding the matching PRIVATE key, can unwrap it.
+
+from cryptography.hazmat.primitives.asymmetric import padding as _asym_padding
+
+def rsa_wrap_key(server_public_key, key_material: bytes) -> bytes:
+    """Encrypt (wrap) a symmetric key with the server's RSA public key using OAEP."""
+    return server_public_key.encrypt(
+        key_material,
+        _asym_padding.OAEP(
+            mgf=_asym_padding.MGF1(hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        ),
+    )
+
+def rsa_unwrap_key(server_private_key, wrapped_key: bytes) -> bytes:
+    """Decrypt (unwrap) a symmetric key with the server's RSA private key using OAEP."""
+    return server_private_key.decrypt(
+        wrapped_key,
+        _asym_padding.OAEP(
+            mgf=_asym_padding.MGF1(hashes.SHA256()),
+            algorithm=hashes.SHA256(),
+            label=None,
+        ),
+    )
