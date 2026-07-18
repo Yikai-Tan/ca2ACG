@@ -137,9 +137,15 @@ def receive_and_store_file(conn, shared_secret: bytes) -> bool:
     # aes_gcm_decrypt() IS the integrity check. If the tag doesn't match,
     # it raises InvalidTag instead of returning anything, so there's no
     # way to accidentally skip the check.
+    # >>>>> AAD ADD: START >>>>>
+    # Must match the client's AAD byte-for-byte (filename + salt), or the
+    # tag check fails even if the ciphertext itself is untouched.
+    aad = filename.encode("utf-8") + salt
+
     print("[TRANSFER] Decrypting + verifying with AES-256-GCM...")
+    # <<<<< AAD ADD: END <<<<<
     try:
-        plaintext = crypto_utils.aes_gcm_decrypt(aes_key, iv, ciphertext, tag)
+        plaintext = crypto_utils.aes_gcm_decrypt(aes_key, iv, ciphertext, tag, aad)
     except InvalidTag:
         print("[TRANSFER] +===============================================+")
         print("[TRANSFER] |  [FAIL] GCM TAG VERIFICATION FAILED!             |")

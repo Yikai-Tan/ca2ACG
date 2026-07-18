@@ -66,11 +66,16 @@ def derive_at_rest_key(shared_secret: bytes, salt: bytes) -> bytes:
 # No padding needed (unlike CBC), and no separate HMAC needed either —
 # the "tag" IS the integrity proof.
 
-def aes_gcm_encrypt(key: bytes, plaintext: bytes) -> tuple:
-    """Encrypt plaintext using AES-256-GCM. Returns (nonce, ciphertext, tag)."""
+# >>>>> AAD ADD: START >>>>>
+def aes_gcm_encrypt(key: bytes, plaintext: bytes, aad: bytes = b"") -> tuple:
+    """Encrypt plaintext using AES-256-GCM. Returns (nonce, ciphertext, tag).
+    aad (Additional Authenticated Data) is NOT encrypted -- it stays
+    readable -- but IS covered by the tag, so it can't be tampered with
+    without decryption failing, same as the ciphertext itself."""
     nonce = os.urandom(AES_GCM_NONCE_SIZE)
 
     encryptor = Cipher(algorithms.AES(key), modes.GCM(nonce)).encryptor()
+    encryptor.authenticate_additional_data(aad)
     ciphertext = encryptor.update(plaintext) + encryptor.finalize()
 
     # encryptor.tag is only available AFTER finalize() — it's computed from
@@ -78,12 +83,16 @@ def aes_gcm_encrypt(key: bytes, plaintext: bytes) -> tuple:
     return nonce, ciphertext, encryptor.tag
 
 
-def aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes) -> bytes:
-    """Decrypt AES-256-GCM ciphertext. Raises InvalidTag if the data was
+def aes_gcm_decrypt(key: bytes, nonce: bytes, ciphertext: bytes, tag: bytes, aad: bytes = b"") -> bytes:
+    """Decrypt AES-256-GCM ciphertext. `aad` must be byte-for-byte identical
+    to what was used during encryption, or this raises InvalidTag -- exactly
+    like a tampered ciphertext would. Raises InvalidTag if the data was
     tampered with or corrupted — this call IS the integrity check, there's
     no separate verify step to remember."""
     decryptor = Cipher(algorithms.AES(key), modes.GCM(nonce, tag)).decryptor()
+    decryptor.authenticate_additional_data(aad)
     return decryptor.update(ciphertext) + decryptor.finalize()
+# <<<<< AAD ADD: END <<<<<
 # <<<<< GCM SWAP: END <<<<<
 
 

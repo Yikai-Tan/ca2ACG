@@ -129,10 +129,17 @@ def transfer_file(sock, filepath: str, client_private_key, shared_secret: bytes)
     print(f"[TRANSFER]   Session salt: {salt.hex()}")
     print(f"[TRANSFER]   [OK] AES-256 key derived (info='aes-encryption-key')")
 
+    # >>>>> AAD ADD: START >>>>>
+    # Bind filename + salt to the ciphertext via AAD. Neither is secret
+    # (both travel in plain text in the payload below), but this stops an
+    # attacker from swapping/tampering with either without the tag failing.
+    aad = filename.encode("utf-8") + salt
+
     # AES-256-GCM encryption -- produces ciphertext AND an authentication
     # tag in one call. No padding, no separate MAC step.
     print("[TRANSFER] Encrypting file with AES-256-GCM...")
-    iv, ciphertext, tag = crypto_utils.aes_gcm_encrypt(aes_key, file_data)
+    iv, ciphertext, tag = crypto_utils.aes_gcm_encrypt(aes_key, file_data, aad)
+    # <<<<< AAD ADD: END <<<<<
     print(f"[TRANSFER]   Nonce:      {iv.hex()}")
     print(f"[TRANSFER]   Tag:        {tag.hex()}")
     print(f"[TRANSFER]   Ciphertext: {len(ciphertext):,} bytes")
