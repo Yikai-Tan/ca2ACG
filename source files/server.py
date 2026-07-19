@@ -1,9 +1,11 @@
+# >>>>> GCM SWAP: START >>>>>
 """
 Secure File Transfer Server -- receives encrypted files over TCP,
-verifies HMAC integrity, and stores them encrypted at rest with RSA signatures.
+verifies integrity via AES-GCM, and stores them encrypted at rest with RSA signatures.
 
 Contributed by: [Member Name]
 """
+# <<<<< GCM SWAP: END <<<<<
 
 import os
 import sys
@@ -15,7 +17,7 @@ import datetime
 # Cryptographic primitives
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
-from cryptography.exceptions import InvalidSignature
+from cryptography.exceptions import InvalidSignature, InvalidTag
 
 # Shared crypto utilities
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -101,10 +103,10 @@ def perform_handshake(conn, client_public_key, server_private_key) -> bool:
         return False
 
 
-# Receive File + Encrypt-then-MAC Verification
+# Receive File + AES-GCM Verification
 
-def receive_and_store_file(conn, server_private_key, client_public_key, store_key: bytes) -> bool:
-    """Receive an encrypted file, verify HMAC, decrypt, and store encrypted at rest."""
+def receive_and_store_file(conn, server_private_key, client_public_key, store_key) -> bool:
+    """Receive an encrypted file, decrypt+verify with AES-GCM, and store encrypted at rest."""
     print("\n[TRANSFER] Waiting for file transfer payload...")
 
     # Receive and parse JSON payload
@@ -118,12 +120,12 @@ def receive_and_store_file(conn, server_private_key, client_public_key, store_ke
         print(f"[TRANSFER] [FAIL] Malformed JSON payload: {e}")
         return False
 
-    # Decode binary fields from transport encoding
+    # Decode binary fields from transport encoding.
     try:
         wrapped_key    = base64.b64decode(payload["wrapped_key"])
         salt           = bytes.fromhex(payload["salt"])
-        iv             = bytes.fromhex(payload["iv"])
-        received_hmac  = bytes.fromhex(payload["hmac"])
+        iv             = bytes.fromhex(payload["iv"])  # this is the GCM nonce
+        tag            = bytes.fromhex(payload["tag"])
         ciphertext     = base64.b64decode(payload["ciphertext"])
         filename       = payload["filename"]
         file_signature = base64.b64decode(payload["signature"])
@@ -131,14 +133,14 @@ def receive_and_store_file(conn, server_private_key, client_public_key, store_ke
         print(f"[TRANSFER] [FAIL] Malformed payload fields: {e}")
         return False
 
-    # NOTE: the filename is authenticated by the HMAC below, so we must MAC the
-    # value exactly as received. Sanitizing happens only AFTER the MAC verifies.
+    # NOTE: the filename is authenticated by GCM AAD, so we must authenticate the
+    # value exactly as received. Sanitizing happens only AFTER GCM verification.
     raw_filename = filename
 
     print(f"[TRANSFER] Received payload for file: '{filename}'")
     print(f"[TRANSFER]   Salt:       {salt.hex()}")
-    print(f"[TRANSFER]   IV:         {iv.hex()}")
-    print(f"[TRANSFER]   HMAC:       {received_hmac.hex()[:40]}...")
+    print(f"[TRANSFER]   Nonce:      {iv.hex()}")
+    print(f"[TRANSFER]   Tag:        {tag.hex()}")
     print(f"[TRANSFER]   Ciphertext: {len(ciphertext):,} bytes")
     print(f"[TRANSFER]   Signature:  {len(file_signature)} bytes")
 
@@ -151,35 +153,35 @@ def receive_and_store_file(conn, server_private_key, client_public_key, store_ke
         return False
     print(f"[TRANSFER] [OK] Session key recovered ({len(session_key)} bytes).")
 
-    # Derive AES + HMAC keys from the recovered session key via HKDF
-    aes_key, hmac_key = crypto_utils.derive_keys(session_key, salt)
-    print("[TRANSFER] [OK] AES + HMAC keys derived.")
+    # Derive AES session key from recovered session key via HKDF-SHA256
+    print("[TRANSFER] Re-deriving AES key via HKDF-SHA256...")
+    aes_key = crypto_utils.derive_keys(session_key, salt)
+    print("[TRANSFER] [OK] AES key derived.")
 
-    # Verify HMAC before decryption (Encrypt-then-MAC)
-    print("[TRANSFER] +===============================================+")
-    print("[TRANSFER] |  VERIFYING HMAC (Encrypt-then-MAC)          |")
-    print("[TRANSFER] +===============================================+")
+    # Reconstruct AAD byte-for-byte (wrapped_key + salt + raw_filename),
+    # or the tag check fails even if the ciphertext itself is untouched.
+    aad = wrapped_key + salt + raw_filename.encode("utf-8")
 
-    # Recompute the MAC over ALL payload fields (must match client exactly)
-    hmac_data = wrapped_key + salt + iv + ciphertext + raw_filename.encode("utf-8")
-
-    if not crypto_utils.verify_hmac(hmac_key, hmac_data, received_hmac):
+    print("[TRANSFER] Decrypting + verifying with AES-256-GCM...")
+    try:
+        plaintext = crypto_utils.aes_gcm_decrypt(aes_key, iv, ciphertext, tag, aad)
+    except InvalidTag:
         print("[TRANSFER] +===============================================+")
-        print("[TRANSFER] |  [FAIL] HMAC VERIFICATION FAILED!                |")
+        print("[TRANSFER] |  [FAIL] GCM TAG VERIFICATION FAILED!             |")
         print("[TRANSFER] |  Data integrity compromised -- aborting.     |")
         print("[TRANSFER] +===============================================+")
         print("[TRANSFER] Possible causes:")
         print("[TRANSFER]   - Ciphertext tampered with in transit")
-        print("[TRANSFER]   - IV modified by an attacker")
-        print("[TRANSFER]   - Client and server have different shared secrets")
+        print("[TRANSFER]   - Nonce or tag modified by an attacker")
+        print("[TRANSFER]   - Client and server have different shared secrets / session keys")
 
         try:
-            crypto_utils.send_msg(conn, b"HMAC_FAIL")
+            crypto_utils.send_msg(conn, b"TAG_FAIL")
         except Exception:
             pass
         return False
 
-    print("[TRANSFER] [OK] HMAC verified -- all payload fields authentic!")
+    print(f"[TRANSFER] [OK] Decrypted + verified {len(plaintext):,} bytes of original file data.")
 
     # Now that the filename is proven authentic, sanitize it to prevent path
     # traversal (e.g. "../../etc/x") before it is ever used in a file path.
@@ -187,19 +189,6 @@ def receive_and_store_file(conn, server_private_key, client_public_key, store_ke
     if not filename or filename in (".", ".."):
         print("[TRANSFER] [FAIL] Invalid filename in payload -- rejecting.")
         return False
-    print("[TRANSFER]   (No tampering detected; safe to proceed with decryption)")
-
-    # Decrypt ciphertext (AES-256-CBC)
-    print("[TRANSFER] Decrypting file data with AES-256-CBC...")
-    try:
-        plaintext = crypto_utils.aes_cbc_decrypt(aes_key, iv, ciphertext)
-    except ValueError as e:
-        print(f"[TRANSFER] [FAIL] Decryption failed (padding error): {e}")
-        print("[TRANSFER]   This should not happen after HMAC verification.")
-        print("[TRANSFER]   Possible implementation bug or key mismatch.")
-        return False
-
-    print(f"[TRANSFER] [OK] Decrypted {len(plaintext):,} bytes of original file data.")
 
     # Verify the client's RSA-PSS signature over the plaintext BEFORE storing.
     # Without this check, "non-repudiation" is meaningless -- we would be
@@ -232,15 +221,17 @@ def receive_and_store_file(conn, server_private_key, client_public_key, store_ke
     at_rest_salt = os.urandom(crypto_utils.HKDF_SALT_SIZE)
     at_rest_key = crypto_utils.derive_at_rest_key(store_key, at_rest_salt)
 
-    at_rest_iv, at_rest_ciphertext = crypto_utils.aes_cbc_encrypt(
+    # GCM encrypt for at-rest storage so disk tampering is detectable.
+    at_rest_iv, at_rest_ciphertext, at_rest_tag = crypto_utils.aes_gcm_encrypt(
         at_rest_key, plaintext
     )
 
-    # Save format: [salt][IV][ciphertext]
+    # Save format: [salt][nonce][tag][ciphertext] -- tag is always 16 bytes
     enc_filepath = os.path.join(RECEIVED_DIR, filename + ".enc")
     with open(enc_filepath, "wb") as f:
         f.write(at_rest_salt)
         f.write(at_rest_iv)
+        f.write(at_rest_tag)
         f.write(at_rest_ciphertext)
     print(f"[TRANSFER] [OK] Encrypted file saved: {enc_filepath}")
 
@@ -272,7 +263,7 @@ def main():
     print("=" * 64)
     print("  +======================================================+")
     print("  |         SECURE FILE TRANSFER SERVER v1.0            |")
-    print("  |   AES-256-CBC + HMAC-SHA256 + RSA-PSS Signatures   |")
+    print("  |   AES-256-GCM + RSA-PSS Signatures                 |")
     print("  +======================================================+")
     print("=" * 64)
 

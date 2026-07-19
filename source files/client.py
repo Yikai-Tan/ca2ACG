@@ -1,8 +1,10 @@
+# >>>>> GCM SWAP: START >>>>>
 """
-RSA challenge-response auth, AES-256-CBC
-encryption with HMAC-SHA256 (Encrypt-then-MAC), and RSA-PSS signatures.
+RSA challenge-response auth, AES-256-GCM
+encryption (built-in authentication, no separate HMAC), and RSA-PSS signatures.
 
 """
+# <<<<< GCM SWAP: END <<<<<
 
 import os
 import sys
@@ -113,7 +115,7 @@ def sign_file(private_key, file_data: bytes) -> bytes:
 # Encrypt, MAC, Sign, and Transmit
 
 def transfer_file(sock, filepath: str, client_private_key, server_public_key) -> bool:
-    """Encrypt a file with AES-256-CBC, authenticate with HMAC-SHA256, sign with RSA-PSS, and send."""
+    """Encrypt a file with AES-256-GCM, sign with RSA-PSS, and send."""
     filename = os.path.basename(filepath)
     print(f"\n[TRANSFER] Preparing to send: '{filename}'")
 
@@ -143,35 +145,32 @@ def transfer_file(sock, filepath: str, client_private_key, server_public_key) ->
     wrapped_key = crypto_utils.rsa_wrap_key(server_public_key, session_key)
     print(f"[TRANSFER]   [OK] Session key wrapped with server public key ({len(wrapped_key)} bytes)")
 
-    # Derive independent AES + HMAC keys from the session key via HKDF
+    # Derive AES session key from the session key via HKDF (fresh salt per transfer)
+    print("[TRANSFER] Deriving session key via HKDF-SHA256...")
     salt = os.urandom(crypto_utils.HKDF_SALT_SIZE)
-    aes_key, hmac_key = crypto_utils.derive_keys(session_key, salt)
+    aes_key = crypto_utils.derive_keys(session_key, salt)
     print(f"[TRANSFER]   Session salt: {salt.hex()}")
-    print(f"[TRANSFER]   [OK] AES-256 + HMAC keys derived from session key")
+    print(f"[TRANSFER]   [OK] AES-256 key derived (info='aes-encryption-key')")
 
-    # AES-256-CBC encryption
-    print("[TRANSFER] Encrypting file with AES-256-CBC...")
-    iv, ciphertext = crypto_utils.aes_cbc_encrypt(aes_key, file_data)
-    print(f"[TRANSFER]   IV:         {iv.hex()}")
-    print(f"[TRANSFER]   Ciphertext: {len(ciphertext):,} bytes "
-          f"(+{len(ciphertext) - len(file_data)} bytes padding overhead)")
+    # Bind wrapped_key + salt + filename to the ciphertext via AAD (Additional Authenticated Data).
+    # None of these are secret (they travel in plain text in the payload below),
+    # but this stops an attacker from swapping/tampering with any of them without the GCM tag failing.
+    aad = wrapped_key + salt + filename.encode("utf-8")
 
-    # HMAC-SHA256 over (IV || ciphertext) -- Encrypt-then-MAC
-    print("[TRANSFER] Computing HMAC-SHA256 over (IV || ciphertext)...")
-    # Authenticate ALL payload fields, not just IV||ciphertext. Fields left
-    # outside the MAC (wrapped_key, salt, filename) could otherwise be altered
-    # by an active MITM without detection.
-    hmac_data = wrapped_key + salt + iv + ciphertext + filename.encode("utf-8")
-    mac = crypto_utils.compute_hmac(hmac_key, hmac_data)
-    print(f"[TRANSFER]   HMAC:       {mac.hex()[:40]}...")
-    print(f"[TRANSFER]   HMAC input: {len(hmac_data):,} bytes (wrapped_key + salt + IV + ciphertext + filename)")
+    # AES-256-GCM encryption -- produces ciphertext AND an authentication
+    # tag in one call. No padding, no separate MAC step.
+    print("[TRANSFER] Encrypting file with AES-256-GCM...")
+    iv, ciphertext, tag = crypto_utils.aes_gcm_encrypt(aes_key, file_data, aad)
+    print(f"[TRANSFER]   Nonce:      {iv.hex()}")
+    print(f"[TRANSFER]   Tag:        {tag.hex()}")
+    print(f"[TRANSFER]   Ciphertext: {len(ciphertext):,} bytes")
 
-    # Build and send JSON payload
+    # Build and send JSON payload -- "hmac" field replaced by "tag"
     payload = {
         "wrapped_key": base64.b64encode(wrapped_key).decode("utf-8"),
         "salt":       salt.hex(),
         "iv":         iv.hex(),
-        "hmac":       mac.hex(),
+        "tag":        tag.hex(),
         "ciphertext": base64.b64encode(ciphertext).decode("utf-8"),
         "filename":   filename,
         "signature":  base64.b64encode(file_signature).decode("utf-8"),
@@ -191,8 +190,8 @@ def transfer_file(sock, filepath: str, client_private_key, server_public_key) ->
         if result == b"TRANSFER_OK":
             print("[TRANSFER] [OK] Server confirmed successful receipt and storage!")
             return True
-        elif result == b"HMAC_FAIL":
-            print("[TRANSFER] [FAIL] Server reported HMAC verification failure!")
+        elif result == b"TAG_FAIL":
+            print("[TRANSFER] [FAIL] Server reported GCM tag verification failure!")
             print("[TRANSFER]   The data may have been tampered with in transit,")
             print("[TRANSFER]   or the shared secrets don't match.")
             return False
@@ -213,7 +212,7 @@ def main():
     print("=" * 64)
     print("  +======================================================+")
     print("  |         SECURE FILE TRANSFER CLIENT v1.0            |")
-    print("  |   AES-256-CBC + HMAC-SHA256 + RSA-PSS Signatures   |")
+    print("  |   AES-256-GCM + RSA-PSS Signatures                 |")
     print("  +======================================================+")
     print("=" * 64)
 
