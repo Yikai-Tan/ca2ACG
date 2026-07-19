@@ -31,12 +31,12 @@ DEPLOY_DIR = os.path.join(SCRIPT_DIR, "..", "deployment files")
 
 CLIENT_PRIVATE_KEY_PATH = os.path.join(DEPLOY_DIR, "client_private.pem")
 CLIENT_PUBLIC_KEY_PATH  = os.path.join(DEPLOY_DIR, "client_public.pem")
-SHARED_SECRET_PATH      = os.path.join(DEPLOY_DIR, "shared_secret.key")
+SERVER_PUBLIC_KEY_PATH  = os.path.join(DEPLOY_DIR, "server_public.pem")
 
 
 # RSA Challenge-Response Authentication
 
-def perform_handshake(sock, client_private_key) -> bool:
+def perform_handshake(sock, client_private_key, server_public_key) -> bool:
     """Respond to the server's RSA challenge-response authentication."""
     print("[HANDSHAKE] Waiting for server challenge (nonce)...")
 
@@ -48,21 +48,23 @@ def perform_handshake(sock, client_private_key) -> bool:
 
     print(f"[HANDSHAKE] Received {len(nonce)}-byte nonce: {nonce.hex()[:40]}...")
 
-    print("[HANDSHAKE] Signing nonce with RSA-PSS (SHA-256)...")
+    # Our own challenge to the server (mutual auth)
+    client_nonce = os.urandom(crypto_utils.NONCE_SIZE)
+
+    print("[HANDSHAKE] Signing server nonce with RSA-PSS (SHA-256)...")
     signature = client_private_key.sign(
         nonce,
         asym_padding.PSS(
-            mgf=asym_padding.MGF1(
-                hashes.SHA256()
-            ),
+            mgf=asym_padding.MGF1(hashes.SHA256()),
             salt_length=asym_padding.PSS.MAX_LENGTH,
         ),
         hashes.SHA256(),
     )
     print(f"[HANDSHAKE] Signature generated ({len(signature)} bytes).")
 
+    crypto_utils.send_msg(sock, client_nonce)   # send our challenge first
     crypto_utils.send_msg(sock, signature)
-    print("[HANDSHAKE] Signature sent. Awaiting server verification result...")
+    print("[HANDSHAKE] Nonce + signature sent. Awaiting server verification...")
 
     try:
         result = crypto_utils.recv_msg(sock)
@@ -71,7 +73,22 @@ def perform_handshake(sock, client_private_key) -> bool:
         return False
 
     if result == b"AUTH_OK":
-        print("[HANDSHAKE] [OK] Server accepted our identity -- authentication passed!")
+        # Mutual auth: verify the server signed OUR nonce with its private key.
+        try:
+            server_sig = crypto_utils.recv_msg(sock)
+            server_public_key.verify(
+                server_sig,
+                client_nonce,
+                asym_padding.PSS(
+                    mgf=asym_padding.MGF1(hashes.SHA256()),
+                    salt_length=asym_padding.PSS.MAX_LENGTH,
+                ),
+                hashes.SHA256(),
+            )
+        except Exception:
+            print("[HANDSHAKE] [FAIL] Server identity check FAILED -- possible rogue server!")
+            return False
+        print("[HANDSHAKE] [OK] Mutual auth complete -- server identity confirmed!")
         return True
     else:
         print("[HANDSHAKE] [FAIL] Server REJECTED our identity -- authentication failed!")
@@ -97,8 +114,8 @@ def sign_file(private_key, file_data: bytes) -> bytes:
 
 # Encrypt, MAC, Sign, and Transmit
 
-def transfer_file(sock, filepath: str, client_private_key, shared_secret: bytes) -> bool:
-    """Encrypt a file with AES-256-CBC, authenticate with HMAC-SHA256, sign with RSA-PSS, and send."""
+def transfer_file(sock, filepath: str, client_private_key, server_public_key) -> bool:
+    """Encrypt a file with AES-256-GCM, sign with RSA-PSS, and send."""
     filename = os.path.basename(filepath)
     print(f"\n[TRANSFER] Preparing to send: '{filename}'")
 
@@ -120,32 +137,37 @@ def transfer_file(sock, filepath: str, client_private_key, shared_secret: bytes)
     file_signature = sign_file(client_private_key, file_data)
     print(f"[TRANSFER] [OK] RSA signature generated ({len(file_signature)} bytes)")
 
-    # >>>>> GCM SWAP: START >>>>>
-    # Derive AES key via HKDF (fresh salt per transfer).
-    # Only one key now -- no separate HMAC key needed.
+    # Generate a FRESH random session key for THIS transfer, then RSA-wrap it
+    # to the server's public key (RSA-OAEP). This is the key transport step:
+    # the encryption key is now established over the channel, not pre-shared.
+    print("[TRANSFER] Generating fresh 32-byte session key...")
+    session_key = os.urandom(crypto_utils.AES_KEY_SIZE)
+    wrapped_key = crypto_utils.rsa_wrap_key(server_public_key, session_key)
+    print(f"[TRANSFER]   [OK] Session key wrapped with server public key ({len(wrapped_key)} bytes)")
+
+    # Derive AES session key from the session key via HKDF (fresh salt per transfer)
     print("[TRANSFER] Deriving session key via HKDF-SHA256...")
     salt = os.urandom(crypto_utils.HKDF_SALT_SIZE)
-    aes_key = crypto_utils.derive_keys(shared_secret, salt)
+    aes_key = crypto_utils.derive_keys(session_key, salt)
     print(f"[TRANSFER]   Session salt: {salt.hex()}")
     print(f"[TRANSFER]   [OK] AES-256 key derived (info='aes-encryption-key')")
 
-    # >>>>> AAD ADD: START >>>>>
-    # Bind filename + salt to the ciphertext via AAD. Neither is secret
-    # (both travel in plain text in the payload below), but this stops an
-    # attacker from swapping/tampering with either without the tag failing.
-    aad = filename.encode("utf-8") + salt
+    # Bind wrapped_key + salt + filename to the ciphertext via AAD (Additional Authenticated Data).
+    # None of these are secret (they travel in plain text in the payload below),
+    # but this stops an attacker from swapping/tampering with any of them without the GCM tag failing.
+    aad = wrapped_key + salt + filename.encode("utf-8")
 
     # AES-256-GCM encryption -- produces ciphertext AND an authentication
     # tag in one call. No padding, no separate MAC step.
     print("[TRANSFER] Encrypting file with AES-256-GCM...")
     iv, ciphertext, tag = crypto_utils.aes_gcm_encrypt(aes_key, file_data, aad)
-    # <<<<< AAD ADD: END <<<<<
     print(f"[TRANSFER]   Nonce:      {iv.hex()}")
     print(f"[TRANSFER]   Tag:        {tag.hex()}")
     print(f"[TRANSFER]   Ciphertext: {len(ciphertext):,} bytes")
 
     # Build and send JSON payload -- "hmac" field replaced by "tag"
     payload = {
+        "wrapped_key": base64.b64encode(wrapped_key).decode("utf-8"),
         "salt":       salt.hex(),
         "iv":         iv.hex(),
         "tag":        tag.hex(),
@@ -153,7 +175,6 @@ def transfer_file(sock, filepath: str, client_private_key, shared_secret: bytes)
         "filename":   filename,
         "signature":  base64.b64encode(file_signature).decode("utf-8"),
     }
-    # <<<<< GCM SWAP: END <<<<<
 
     payload_json = json.dumps(payload, indent=None)
     payload_bytes = payload_json.encode("utf-8")
@@ -169,13 +190,11 @@ def transfer_file(sock, filepath: str, client_private_key, shared_secret: bytes)
         if result == b"TRANSFER_OK":
             print("[TRANSFER] [OK] Server confirmed successful receipt and storage!")
             return True
-        # >>>>> GCM SWAP: START >>>>>
         elif result == b"TAG_FAIL":
             print("[TRANSFER] [FAIL] Server reported GCM tag verification failure!")
             print("[TRANSFER]   The data may have been tampered with in transit,")
             print("[TRANSFER]   or the shared secrets don't match.")
             return False
-        # <<<<< GCM SWAP: END <<<<<
         else:
             decoded = result.decode("utf-8", errors="replace")
             print(f"[TRANSFER] [FAIL] Unexpected server response: {decoded}")
@@ -192,10 +211,8 @@ def main():
     """Parse arguments, load keys, connect, authenticate, and transfer the file."""
     print("=" * 64)
     print("  +======================================================+")
-    # >>>>> GCM SWAP: START >>>>>
     print("  |         SECURE FILE TRANSFER CLIENT v1.0            |")
     print("  |   AES-256-GCM + RSA-PSS Signatures                 |")
-    # <<<<< GCM SWAP: END <<<<<
     print("  +======================================================+")
     print("=" * 64)
 
@@ -222,9 +239,9 @@ def main():
         print(f"[INIT]   [OK] Client private key loaded: "
               f"{os.path.basename(CLIENT_PRIVATE_KEY_PATH)}")
 
-        shared_secret = crypto_utils.load_shared_secret(SHARED_SECRET_PATH)
-        print(f"[INIT]   [OK] Shared secret loaded:      "
-              f"{os.path.basename(SHARED_SECRET_PATH)} ({len(shared_secret)} bytes)")
+        server_public_key = crypto_utils.load_public_key(SERVER_PUBLIC_KEY_PATH)
+        print(f"[INIT]   [OK] Server public key loaded:  "
+              f"{os.path.basename(SERVER_PUBLIC_KEY_PATH)}")
 
     except FileNotFoundError as e:
         print(f"\n[INIT] [FAIL] ERROR: Key file not found: {e}")
@@ -243,12 +260,12 @@ def main():
         sock.connect((SERVER_HOST, SERVER_PORT))
         print(f"[CONN] [OK] TCP connection established!")
 
-        if not perform_handshake(sock, client_private_key):
+        if not perform_handshake(sock, client_private_key, server_public_key):
             print("\n[CONN] [FAIL] Authentication failed -- aborting transfer.")
             sock.close()
             sys.exit(1)
 
-        if transfer_file(sock, filepath, client_private_key, shared_secret):
+        if transfer_file(sock, filepath, client_private_key, server_public_key):
             print("\n" + "=" * 64)
             print("  [OK] FILE TRANSFERRED SUCCESSFULLY!")
             print("=" * 64)

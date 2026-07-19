@@ -33,14 +33,14 @@ DEPLOY_DIR = os.path.join(SCRIPT_DIR, "..", "deployment files")
 
 SERVER_PRIVATE_KEY_PATH = os.path.join(DEPLOY_DIR, "server_private.pem")
 CLIENT_PUBLIC_KEY_PATH  = os.path.join(DEPLOY_DIR, "client_public.pem")
-SHARED_SECRET_PATH      = os.path.join(DEPLOY_DIR, "shared_secret.key")
+SERVER_STORE_KEY_PATH   = os.path.join(DEPLOY_DIR, "server_store.key")
 
 RECEIVED_DIR = os.path.join(SCRIPT_DIR, "..", "received_files")
 
 
 # RSA Challenge-Response Authentication
 
-def perform_handshake(conn, client_public_key) -> bool:
+def perform_handshake(conn, client_public_key, server_private_key) -> bool:
     """Execute RSA challenge-response authentication with the client."""
     print("[HANDSHAKE] Starting RSA challenge-response authentication...")
 
@@ -49,9 +49,10 @@ def perform_handshake(conn, client_public_key) -> bool:
           f"{nonce.hex()[:40]}...")
 
     crypto_utils.send_msg(conn, nonce)
-    print("[HANDSHAKE] Nonce sent to client. Awaiting signed response...")
+    print("[HANDSHAKE] Nonce sent to client. Awaiting client nonce + signature...")
 
     try:
+        client_nonce = crypto_utils.recv_msg(conn)   # client's challenge to us
         signature = crypto_utils.recv_msg(conn)
     except ConnectionError as e:
         print(f"[HANDSHAKE] [FAIL] Connection error while receiving signature: {e}")
@@ -74,6 +75,19 @@ def perform_handshake(conn, client_public_key) -> bool:
 
         print("[HANDSHAKE] [OK] RSA-PSS signature verified -- client authenticated!")
         crypto_utils.send_msg(conn, b"AUTH_OK")
+
+        # Mutual auth: sign the client's nonce with OUR private key so the
+        # client can confirm it is talking to the genuine server.
+        server_sig = server_private_key.sign(
+            client_nonce,
+            asym_padding.PSS(
+                mgf=asym_padding.MGF1(hashes.SHA256()),
+                salt_length=asym_padding.PSS.MAX_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+        crypto_utils.send_msg(conn, server_sig)
+        print("[HANDSHAKE] [OK] Sent our signature over client nonce (mutual auth).")
         return True
 
     except InvalidSignature:
@@ -91,7 +105,7 @@ def perform_handshake(conn, client_public_key) -> bool:
 
 # Receive File + AES-GCM Verification
 
-def receive_and_store_file(conn, shared_secret: bytes) -> bool:
+def receive_and_store_file(conn, server_private_key, client_public_key, store_key) -> bool:
     """Receive an encrypted file, decrypt+verify with AES-GCM, and store encrypted at rest."""
     print("\n[TRANSFER] Waiting for file transfer payload...")
 
@@ -106,10 +120,9 @@ def receive_and_store_file(conn, shared_secret: bytes) -> bool:
         print(f"[TRANSFER] [FAIL] Malformed JSON payload: {e}")
         return False
 
-    # >>>>> GCM SWAP: START >>>>>
     # Decode binary fields from transport encoding.
-    # "hmac" is gone -- replaced by "tag", the GCM authentication tag.
     try:
+        wrapped_key    = base64.b64decode(payload["wrapped_key"])
         salt           = bytes.fromhex(payload["salt"])
         iv             = bytes.fromhex(payload["iv"])  # this is the GCM nonce
         tag            = bytes.fromhex(payload["tag"])
@@ -120,6 +133,10 @@ def receive_and_store_file(conn, shared_secret: bytes) -> bool:
         print(f"[TRANSFER] [FAIL] Malformed payload fields: {e}")
         return False
 
+    # NOTE: the filename is authenticated by GCM AAD, so we must authenticate the
+    # value exactly as received. Sanitizing happens only AFTER GCM verification.
+    raw_filename = filename
+
     print(f"[TRANSFER] Received payload for file: '{filename}'")
     print(f"[TRANSFER]   Salt:       {salt.hex()}")
     print(f"[TRANSFER]   Nonce:      {iv.hex()}")
@@ -127,23 +144,25 @@ def receive_and_store_file(conn, shared_secret: bytes) -> bool:
     print(f"[TRANSFER]   Ciphertext: {len(ciphertext):,} bytes")
     print(f"[TRANSFER]   Signature:  {len(file_signature)} bytes")
 
-    # Re-derive the AES key using HKDF (only one key now -- no HMAC key).
-    print("[TRANSFER] Re-deriving AES key via HKDF-SHA256...")
-    aes_key = crypto_utils.derive_keys(shared_secret, salt)
-    print("[TRANSFER] [OK] Key derived successfully.")
+    # Unwrap the session key with the server's RSA private key (RSA-OAEP)
+    print("[TRANSFER] Unwrapping session key with server private key...")
+    try:
+        session_key = crypto_utils.rsa_unwrap_key(server_private_key, wrapped_key)
+    except Exception as e:
+        print(f"[TRANSFER] [FAIL] Session key unwrap failed: {e}")
+        return False
+    print(f"[TRANSFER] [OK] Session key recovered ({len(session_key)} bytes).")
 
-    # Decrypt + verify in one step (AES-GCM).
-    # There is no separate "check first, then decrypt" phase anymore --
-    # aes_gcm_decrypt() IS the integrity check. If the tag doesn't match,
-    # it raises InvalidTag instead of returning anything, so there's no
-    # way to accidentally skip the check.
-    # >>>>> AAD ADD: START >>>>>
-    # Must match the client's AAD byte-for-byte (filename + salt), or the
-    # tag check fails even if the ciphertext itself is untouched.
-    aad = filename.encode("utf-8") + salt
+    # Derive AES session key from recovered session key via HKDF-SHA256
+    print("[TRANSFER] Re-deriving AES key via HKDF-SHA256...")
+    aes_key = crypto_utils.derive_keys(session_key, salt)
+    print("[TRANSFER] [OK] AES key derived.")
+
+    # Reconstruct AAD byte-for-byte (wrapped_key + salt + raw_filename),
+    # or the tag check fails even if the ciphertext itself is untouched.
+    aad = wrapped_key + salt + raw_filename.encode("utf-8")
 
     print("[TRANSFER] Decrypting + verifying with AES-256-GCM...")
-    # <<<<< AAD ADD: END <<<<<
     try:
         plaintext = crypto_utils.aes_gcm_decrypt(aes_key, iv, ciphertext, tag, aad)
     except InvalidTag:
@@ -154,7 +173,7 @@ def receive_and_store_file(conn, shared_secret: bytes) -> bool:
         print("[TRANSFER] Possible causes:")
         print("[TRANSFER]   - Ciphertext tampered with in transit")
         print("[TRANSFER]   - Nonce or tag modified by an attacker")
-        print("[TRANSFER]   - Client and server have different shared secrets")
+        print("[TRANSFER]   - Client and server have different shared secrets / session keys")
 
         try:
             crypto_utils.send_msg(conn, b"TAG_FAIL")
@@ -163,7 +182,36 @@ def receive_and_store_file(conn, shared_secret: bytes) -> bool:
         return False
 
     print(f"[TRANSFER] [OK] Decrypted + verified {len(plaintext):,} bytes of original file data.")
-    # <<<<< GCM SWAP: END <<<<<
+
+    # Now that the filename is proven authentic, sanitize it to prevent path
+    # traversal (e.g. "../../etc/x") before it is ever used in a file path.
+    filename = os.path.basename(raw_filename)
+    if not filename or filename in (".", ".."):
+        print("[TRANSFER] [FAIL] Invalid filename in payload -- rejecting.")
+        return False
+
+    # Verify the client's RSA-PSS signature over the plaintext BEFORE storing.
+    # Without this check, "non-repudiation" is meaningless -- we would be
+    # storing an unverified blob. Reject the file if the signature is invalid.
+    print("[TRANSFER] Verifying client's RSA-PSS signature (non-repudiation)...")
+    try:
+        client_public_key.verify(
+            file_signature,
+            plaintext,
+            asym_padding.PSS(
+                mgf=asym_padding.MGF1(hashes.SHA256()),
+                salt_length=asym_padding.PSS.MAX_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+        print("[TRANSFER] [OK] Signature valid -- sender authenticity confirmed.")
+    except InvalidSignature:
+        print("[TRANSFER] [FAIL] File signature INVALID -- rejecting file!")
+        try:
+            crypto_utils.send_msg(conn, b"SIG_FAIL")
+        except Exception:
+            pass
+        return False
 
     # Store file encrypted at rest
     print("[TRANSFER] Re-encrypting file for at-rest storage...")
@@ -171,12 +219,9 @@ def receive_and_store_file(conn, shared_secret: bytes) -> bool:
     os.makedirs(RECEIVED_DIR, exist_ok=True)
 
     at_rest_salt = os.urandom(crypto_utils.HKDF_SALT_SIZE)
-    at_rest_key = crypto_utils.derive_at_rest_key(shared_secret, at_rest_salt)
+    at_rest_key = crypto_utils.derive_at_rest_key(store_key, at_rest_salt)
 
-    # >>>>> GCM SWAP: START >>>>>
-    # Same GCM swap applies here -- the stored file now gets its own
-    # authentication tag too, so tampering with the .enc file on disk
-    # (not just in transit) becomes detectable.
+    # GCM encrypt for at-rest storage so disk tampering is detectable.
     at_rest_iv, at_rest_ciphertext, at_rest_tag = crypto_utils.aes_gcm_encrypt(
         at_rest_key, plaintext
     )
@@ -189,7 +234,6 @@ def receive_and_store_file(conn, shared_secret: bytes) -> bool:
         f.write(at_rest_tag)
         f.write(at_rest_ciphertext)
     print(f"[TRANSFER] [OK] Encrypted file saved: {enc_filepath}")
-    # <<<<< GCM SWAP: END <<<<<
 
     # Store RSA signature for non-repudiation
     sig_filepath = os.path.join(RECEIVED_DIR, filename + ".sig")
@@ -218,10 +262,8 @@ def main():
     """Initialize the server, load keys, and listen for incoming connections."""
     print("=" * 64)
     print("  +======================================================+")
-    # >>>>> GCM SWAP: START >>>>>
     print("  |         SECURE FILE TRANSFER SERVER v1.0            |")
     print("  |   AES-256-GCM + RSA-PSS Signatures                 |")
-    # <<<<< GCM SWAP: END <<<<<
     print("  +======================================================+")
     print("=" * 64)
 
@@ -235,9 +277,9 @@ def main():
         client_public_key = crypto_utils.load_public_key(CLIENT_PUBLIC_KEY_PATH)
         print(f"[INIT]   [OK] Client public key loaded:  {os.path.basename(CLIENT_PUBLIC_KEY_PATH)}")
 
-        shared_secret = crypto_utils.load_shared_secret(SHARED_SECRET_PATH)
-        print(f"[INIT]   [OK] Shared secret loaded:      {os.path.basename(SHARED_SECRET_PATH)} "
-              f"({len(shared_secret)} bytes)")
+        store_key = crypto_utils.load_shared_secret(SERVER_STORE_KEY_PATH)
+        print(f"[INIT]   [OK] Store key loaded:          {os.path.basename(SERVER_STORE_KEY_PATH)} "
+              f"({len(store_key)} bytes)")
 
     except FileNotFoundError as e:
         print(f"\n[INIT] [FAIL] ERROR: Key file not found: {e}")
@@ -271,13 +313,13 @@ def main():
             print(f"{'=' * 64}")
 
             try:
-                if not perform_handshake(conn, client_public_key):
+                if not perform_handshake(conn, client_public_key, server_private_key):
                     print(f"[CONN] [FAIL] Authentication failed for {client_address}.")
                     print(f"[CONN] Socket closed immediately (security policy).")
                     conn.close()
                     continue
 
-                if receive_and_store_file(conn, shared_secret):
+                if receive_and_store_file(conn, server_private_key, client_public_key, store_key):
                     print(f"\n[CONN] [OK] Transfer from {client_address} complete!")
                 else:
                     print(f"\n[CONN] [FAIL] Transfer from {client_address} failed.")
