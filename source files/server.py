@@ -127,6 +127,12 @@ def receive_and_store_file(conn, shared_secret: bytes) -> bool:
     print(f"[TRANSFER]   Ciphertext: {len(ciphertext):,} bytes")
     print(f"[TRANSFER]   Signature:  {len(file_signature)} bytes")
 
+    # >>>>> EVIDENCE ADD: START >>>>>
+    # This is literally what crossed the network -- unreadable until it
+    # passes GCM verification below.
+    print(f"[TRANSFER]   Ciphertext as received (first 48 bytes, hex): {ciphertext[:48].hex()}")
+    # <<<<< EVIDENCE ADD: END <<<<<
+
     # Re-derive the AES key using HKDF (only one key now -- no HMAC key).
     print("[TRANSFER] Re-deriving AES key via HKDF-SHA256...")
     aes_key = crypto_utils.derive_keys(shared_secret, salt)
@@ -163,6 +169,13 @@ def receive_and_store_file(conn, shared_secret: bytes) -> bool:
         return False
 
     print(f"[TRANSFER] [OK] Decrypted + verified {len(plaintext):,} bytes of original file data.")
+
+    # >>>>> EVIDENCE ADD: START >>>>>
+    # Completes the story: garbled bytes in, readable content out -- but
+    # only because it just passed the GCM tag check above.
+    plaintext_preview = plaintext[:48].decode("utf-8", errors="replace")
+    print(f"[TRANSFER]   Decrypted content (first 48 bytes): {plaintext_preview!r}")
+    # <<<<< EVIDENCE ADD: END <<<<<
     # <<<<< GCM SWAP: END <<<<<
 
     # Store file encrypted at rest
@@ -189,6 +202,16 @@ def receive_and_store_file(conn, shared_secret: bytes) -> bool:
         f.write(at_rest_tag)
         f.write(at_rest_ciphertext)
     print(f"[TRANSFER] [OK] Encrypted file saved: {enc_filepath}")
+
+    # >>>>> EVIDENCE ADD: START >>>>>
+    # Read the file back OFF DISK (not from the in-memory variables above) --
+    # this proves what's actually sitting in the .enc file is unreadable,
+    # not just that we claim it was saved encrypted.
+    with open(enc_filepath, "rb") as f:
+        stored_bytes = f.read()
+    print(f"[TRANSFER]   Raw bytes on disk (first 48 bytes, hex, read back from the file itself):")
+    print(f"[TRANSFER]   {stored_bytes[:48].hex()}")
+    # <<<<< EVIDENCE ADD: END <<<<<
     # <<<<< GCM SWAP: END <<<<<
 
     # Store RSA signature for non-repudiation

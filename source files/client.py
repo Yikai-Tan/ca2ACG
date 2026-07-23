@@ -144,6 +144,14 @@ def transfer_file(sock, filepath: str, client_private_key, shared_secret: bytes)
     print(f"[TRANSFER]   Tag:        {tag.hex()}")
     print(f"[TRANSFER]   Ciphertext: {len(ciphertext):,} bytes")
 
+    # >>>>> EVIDENCE ADD: START >>>>>
+    # Proof, not just a claim -- print the actual bytes so the transformation
+    # is visible, not just asserted by a "[OK]" message.
+    plaintext_preview = file_data[:48].decode("utf-8", errors="replace")
+    print(f"[TRANSFER]   Plaintext  (first 48 bytes):      {plaintext_preview!r}")
+    print(f"[TRANSFER]   Ciphertext (first 48 bytes, hex): {ciphertext[:48].hex()}")
+    # <<<<< EVIDENCE ADD: END <<<<<
+
     # Build and send JSON payload -- "hmac" field replaced by "tag"
     payload = {
         "salt":       salt.hex(),
