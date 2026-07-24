@@ -40,8 +40,13 @@ RECEIVED_DIR = os.path.join(SCRIPT_DIR, "..", "received_files")
 
 # RSA Challenge-Response Authentication
 
-def perform_handshake(conn, client_public_key, server_private_key) -> bool:
-    """Execute RSA challenge-response authentication with the client."""
+def perform_handshake(conn, client_public_key, server_private_key):
+    """Execute RSA challenge-response authentication with the client.
+
+    Returns the freshly generated handshake nonce (bytes) on success, or None
+    on failure. The nonce is later bound into the file payload's AAD so a
+    captured payload cannot be replayed onto a different connection.
+    """
     print("[HANDSHAKE] Starting RSA challenge-response authentication...")
 
     nonce = os.urandom(crypto_utils.NONCE_SIZE)
@@ -56,7 +61,7 @@ def perform_handshake(conn, client_public_key, server_private_key) -> bool:
         signature = crypto_utils.recv_msg(conn)
     except ConnectionError as e:
         print(f"[HANDSHAKE] [FAIL] Connection error while receiving signature: {e}")
-        return False
+        return None
 
     print(f"[HANDSHAKE] Received signature ({len(signature)} bytes). Verifying...")
 
@@ -88,7 +93,7 @@ def perform_handshake(conn, client_public_key, server_private_key) -> bool:
         )
         crypto_utils.send_msg(conn, server_sig)
         print("[HANDSHAKE] [OK] Sent our signature over client nonce (mutual auth).")
-        return True
+        return nonce
 
     except InvalidSignature:
         print("[HANDSHAKE] [FAIL] RSA-PSS signature verification FAILED!")
@@ -100,13 +105,18 @@ def perform_handshake(conn, client_public_key, server_private_key) -> bool:
         except Exception:
             pass
 
-        return False
+        return None
 
 
 # Receive File + AES-GCM Verification
 
-def receive_and_store_file(conn, server_private_key, client_public_key, store_key) -> bool:
-    """Receive an encrypted file, decrypt+verify with AES-GCM, and store encrypted at rest."""
+def receive_and_store_file(conn, server_private_key, client_public_key, store_key, server_nonce) -> bool:
+    """Receive an encrypted file, decrypt+verify with AES-GCM, and store encrypted at rest.
+
+    server_nonce is this connection's handshake nonce; it must be folded into
+    the AAD exactly as the client did, so a payload captured from another
+    connection fails the GCM tag check (replay protection).
+    """
     print("\n[TRANSFER] Waiting for file transfer payload...")
 
     # Receive and parse JSON payload
@@ -158,9 +168,12 @@ def receive_and_store_file(conn, server_private_key, client_public_key, store_ke
     aes_key = crypto_utils.derive_keys(session_key, salt)
     print("[TRANSFER] [OK] AES key derived.")
 
-    # Reconstruct AAD byte-for-byte (wrapped_key + salt + raw_filename),
-    # or the tag check fails even if the ciphertext itself is untouched.
-    aad = wrapped_key + salt + raw_filename.encode("utf-8")
+    # Reconstruct AAD byte-for-byte (wrapped_key + salt + raw_filename + server_nonce),
+    # or the tag check fails even if the ciphertext itself is untouched. The
+    # server_nonce ties this payload to THIS connection: a payload captured from
+    # an earlier connection carries that connection's nonce in its tag, so it
+    # fails to verify here and cannot be replayed.
+    aad = wrapped_key + salt + raw_filename.encode("utf-8") + server_nonce
 
     print("[TRANSFER] Decrypting + verifying with AES-256-GCM...")
     try:
@@ -313,13 +326,14 @@ def main():
             print(f"{'=' * 64}")
 
             try:
-                if not perform_handshake(conn, client_public_key, server_private_key):
+                server_nonce = perform_handshake(conn, client_public_key, server_private_key)
+                if not server_nonce:
                     print(f"[CONN] [FAIL] Authentication failed for {client_address}.")
                     print(f"[CONN] Socket closed immediately (security policy).")
                     conn.close()
                     continue
 
-                if receive_and_store_file(conn, server_private_key, client_public_key, store_key):
+                if receive_and_store_file(conn, server_private_key, client_public_key, store_key, server_nonce):
                     print(f"\n[CONN] [OK] Transfer from {client_address} complete!")
                 else:
                     print(f"\n[CONN] [FAIL] Transfer from {client_address} failed.")

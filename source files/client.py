@@ -36,15 +36,20 @@ SERVER_PUBLIC_KEY_PATH  = os.path.join(DEPLOY_DIR, "server_public.pem")
 
 # RSA Challenge-Response Authentication
 
-def perform_handshake(sock, client_private_key, server_public_key) -> bool:
-    """Respond to the server's RSA challenge-response authentication."""
+def perform_handshake(sock, client_private_key, server_public_key):
+    """Respond to the server's RSA challenge-response authentication.
+
+    Returns the server's handshake nonce (bytes) on success, or None on
+    failure. The returned nonce is later bound into the file payload's AAD
+    so a captured payload cannot be replayed onto a different connection.
+    """
     print("[HANDSHAKE] Waiting for server challenge (nonce)...")
 
     try:
         nonce = crypto_utils.recv_msg(sock)
     except ConnectionError as e:
         print(f"[HANDSHAKE] [FAIL] Connection error: {e}")
-        return False
+        return None
 
     print(f"[HANDSHAKE] Received {len(nonce)}-byte nonce: {nonce.hex()[:40]}...")
 
@@ -70,7 +75,7 @@ def perform_handshake(sock, client_private_key, server_public_key) -> bool:
         result = crypto_utils.recv_msg(sock)
     except ConnectionError as e:
         print(f"[HANDSHAKE] [FAIL] Connection error: {e}")
-        return False
+        return None
 
     if result == b"AUTH_OK":
         # Mutual auth: verify the server signed OUR nonce with its private key.
@@ -87,14 +92,14 @@ def perform_handshake(sock, client_private_key, server_public_key) -> bool:
             )
         except Exception:
             print("[HANDSHAKE] [FAIL] Server identity check FAILED -- possible rogue server!")
-            return False
+            return None
         print("[HANDSHAKE] [OK] Mutual auth complete -- server identity confirmed!")
-        return True
+        return nonce
     else:
         print("[HANDSHAKE] [FAIL] Server REJECTED our identity -- authentication failed!")
         print("[HANDSHAKE]   Check that client_private.pem matches the server's")
         print("[HANDSHAKE]   copy of client_public.pem.")
-        return False
+        return None
 
 
 # RSA Digital Signature (Non-Repudiation)
@@ -114,8 +119,13 @@ def sign_file(private_key, file_data: bytes) -> bytes:
 
 # Encrypt, MAC, Sign, and Transmit
 
-def transfer_file(sock, filepath: str, client_private_key, server_public_key) -> bool:
-    """Encrypt a file with AES-256-GCM, sign with RSA-PSS, and send."""
+def transfer_file(sock, filepath: str, client_private_key, server_public_key, server_nonce) -> bool:
+    """Encrypt a file with AES-256-GCM, sign with RSA-PSS, and send.
+
+    server_nonce is the server's handshake nonce; it is bound into the AAD
+    so this payload is only valid on the connection it was sent over
+    (replay protection).
+    """
     filename = os.path.basename(filepath)
     print(f"\n[TRANSFER] Preparing to send: '{filename}'")
 
@@ -152,10 +162,14 @@ def transfer_file(sock, filepath: str, client_private_key, server_public_key) ->
     print(f"[TRANSFER]   Session salt: {salt.hex()}")
     print(f"[TRANSFER]   [OK] AES-256 key derived (info='aes-encryption-key')")
 
-    # Bind wrapped_key + salt + filename to the ciphertext via AAD (Additional Authenticated Data).
-    # None of these are secret (they travel in plain text in the payload below),
-    # but this stops an attacker from swapping/tampering with any of them without the GCM tag failing.
-    aad = wrapped_key + salt + filename.encode("utf-8")
+    # Bind wrapped_key + salt + filename + server_nonce to the ciphertext via AAD
+    # (Additional Authenticated Data). None of these are secret (they travel in
+    # plain text in the payload below), but this stops an attacker from
+    # swapping/tampering with any of them without the GCM tag failing. Including
+    # the server's handshake nonce ties this payload to this specific connection,
+    # so a captured payload replayed on a later connection (with a different
+    # nonce) fails the tag check -- this is the replay protection.
+    aad = wrapped_key + salt + filename.encode("utf-8") + server_nonce
 
     # AES-256-GCM encryption -- produces ciphertext AND an authentication
     # tag in one call. No padding, no separate MAC step.
@@ -260,12 +274,13 @@ def main():
         sock.connect((SERVER_HOST, SERVER_PORT))
         print(f"[CONN] [OK] TCP connection established!")
 
-        if not perform_handshake(sock, client_private_key, server_public_key):
+        server_nonce = perform_handshake(sock, client_private_key, server_public_key)
+        if not server_nonce:
             print("\n[CONN] [FAIL] Authentication failed -- aborting transfer.")
             sock.close()
             sys.exit(1)
 
-        if transfer_file(sock, filepath, client_private_key, server_public_key):
+        if transfer_file(sock, filepath, client_private_key, server_public_key, server_nonce):
             print("\n" + "=" * 64)
             print("  [OK] FILE TRANSFERRED SUCCESSFULLY!")
             print("=" * 64)
